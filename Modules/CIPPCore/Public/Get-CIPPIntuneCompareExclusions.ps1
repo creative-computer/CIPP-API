@@ -13,9 +13,11 @@ function Get-CIPPIntuneCompareExclusions {
     #>
     [CmdletBinding()]
     param(
-        # App protection templates store apps[] and deployedAppCount, but deployment
-        # strips apps and the policy read-back never returns either. Scoped because
-        # Device configs carry legitimate nested 'apps' (e.g. kiosk profiles).
+        # App protection templates store apps[], deployedAppCount and isAssigned, but
+        # deployment strips all three and the policy read-back never reproduces them -
+        # isAssigned is server state set by assigning, which the assignment compare
+        # covers on its own. Scoped because Device configs carry legitimate nested
+        # 'apps' (e.g. kiosk profiles).
         [switch]$AppProtection
     )
 
@@ -43,10 +45,14 @@ function Get-CIPPIntuneCompareExclusions {
         'templateId',
         'source',
         'package',
-        'assignments'
+        'assignments',
+        # App configuration policies name their apps by mobileApp id, which differs per tenant by
+        # construction; the app identity captured next to it is deployment metadata, not policy.
+        'targetedMobileApps',
+        'targetedMobileAppsDetails'
     )
     if ($AppProtection) {
-        $Exclusions = $Exclusions + @('apps', 'deployedAppCount')
+        $Exclusions = $Exclusions + @('apps', 'deployedAppCount', 'isAssigned')
     }
     $Exclusions
 }

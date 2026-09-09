@@ -583,14 +583,6 @@ function Invoke-NinjaOneTenantSync {
                 DeviceLink          = $ParsedDeviceName
             }
 
-            Add-CIPPAzDataTableEntity @DeviceTable -Entity @{
-                PartitionKey = $Customer.CustomerId
-                RowKey       = $device.AzureADDeviceId
-                RawDevice    = "$($ParsedDevice | ConvertTo-Json -Depth 100 -Compress)"
-            } -Force
-
-            $ParsedDevices.add($ParsedDevice)
-
             ### Update NinjaOne Device Fields
             if ($MatchedNinjaDevice) {
                 $NinjaDeviceUpdate = [PSCustomObject]@{}
@@ -607,8 +599,8 @@ function Invoke-NinjaOneTenantSync {
                             Icon = 'fas fa-laptop'
                         },
                         @{
-                            Name = 'View Devices in CIPP'
-                            Link = "https://$($CIPPURL)/endpoint/MEM/devices?tenantFilter=$($Customer.defaultDomainName)"
+                            Name = 'View Device in CIPP'
+                            Link = "https://$($CIPPURL)/endpoint/MEM/devices/device?deviceId=$($Device.id)&tenantFilter=$($Customer.defaultDomainName)"
                             Icon = 'far fa-eye'
                         }
                     )
@@ -713,14 +705,29 @@ function Invoke-NinjaOneTenantSync {
 
             }
 
-            # Update Device
+            # Update Device. Default to success so devices with no mapped fields are still cached.
+            $DeviceFieldsUpdated = $true
             if ($MappedFields.DeviceSummary -or $MappedFields.DeviceLinks -or $MappedFields.DeviceCompliance) {
+                $DeviceFieldsUpdated = $false
                 try {
                     $UpdateBody = $NinjaDeviceUpdate | ConvertTo-Json -Depth 100
                     $Result = Invoke-WebRequest -Uri "https://$($Configuration.Instance)/api/v2/device/$($MatchedNinjaDevice.id)/custom-fields" -Method PATCH -Headers @{Authorization = "Bearer $($token.access_token)" } -ContentType 'application/json; charset=utf-8' -Body $UpdateBody
+                    $DeviceFieldsUpdated = $true
                 } catch {
-                    Write-Verbose "Error details: $($_ | ConvertTo-Json -Depth 5)"
+                    $ErrorMessage = Get-CippException -Exception $_
+                    Write-LogMessage -tenant $TenantFilter -API 'NinjaOneSync' -message "Failed to update NinjaOne custom fields for device '$($Device.deviceName)' ($($MatchedNinjaDevice.id)): $($ErrorMessage.NormalizedError)" -Sev 'Warning' -LogData $ErrorMessage
                 }
+            }
+
+            # Only cache the device once its fields have been written, so a failed update is retried on the next sync instead of being skipped permanently.
+            if ($DeviceFieldsUpdated) {
+                Add-CIPPAzDataTableEntity @DeviceTable -Entity @{
+                    PartitionKey = $Customer.CustomerId
+                    RowKey       = $device.AzureADDeviceId
+                    RawDevice    = "$($ParsedDevice | ConvertTo-Json -Depth 100 -Compress)"
+                } -Force
+
+                $ParsedDevices.add($ParsedDevice)
             }
         }
 
@@ -1557,8 +1564,10 @@ function Invoke-NinjaOneTenantSync {
             } catch {
                 $SharePointTenantName = ($Customer.initialDomainName -split '\.')[0]
                 if ($SharePointTenantName) {
+                    # Sovereign clouds do not use sharepoint.com - map the initial domain's suffix.
+                    $SharePointDomain = Get-CIPPSharePointDomain -TenantDomain $Customer.initialDomainName
+                    $SharePointAdminUrl = "https://$SharePointTenantName-admin.$SharePointDomain"
                     Write-Information "NinjaOneSync: Get-SharePointAdminLink failed for $($Customer.defaultDomainName), using fallback SharePoint admin URL '$SharePointAdminUrl'. Error: $($_.Exception.Message)"
-                    $SharePointAdminUrl = "https://$SharePointTenantName-admin.sharepoint.com"
                 }
             }
 
@@ -1585,7 +1594,11 @@ function Invoke-NinjaOneTenantSync {
                 },
                 @{
                     Name = 'SharePoint Admin'
-                    Link = $SharePointAdminUrl ?? "https://$($Customer.defaultDomainName)-admin.sharepoint.com"
+                    # No guess here: the old fallback pasted defaultDomainName in front of
+                    # '-admin.sharepoint.com' ('contoso.onmicrosoft.com-admin.sharepoint.com') and
+                    # assumed the commercial cloud. Unresolved links are dropped below instead -
+                    # NinjaOne keeps whatever we write, so a bad URL sticks around in their portal.
+                    Link = $SharePointAdminUrl
                     Icon = 'fas fa-shapes'
                 },
                 @{
@@ -1620,6 +1633,9 @@ function Invoke-NinjaOneTenantSync {
                 }
 
             )
+
+            # Drop any portal we could not build a URL for rather than publishing a dead link.
+            $ManagementLinksData = @($ManagementLinksData | Where-Object { $_.Link })
 
             $M365LinksHTML = Get-NinjaOneLinks -Data $ManagementLinksData -Title 'Portals' -SmallCols 2 -MedCols 3 -LargeCols 3 -XLCols 3
 

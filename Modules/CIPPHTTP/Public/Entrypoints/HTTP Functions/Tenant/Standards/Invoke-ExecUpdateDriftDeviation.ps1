@@ -73,16 +73,19 @@ function Invoke-ExecUpdateDriftDeviation {
             $Deviations = $Request.Body.deviations
             $Reason = $Request.Body.reason
             $PersistentDeny = [bool]($Request.Body.persistentDeny)
+            # Intune multi-admin approval rejects any write that carries no justification header
+            # ("Header 'x-msft-approval-justification' is required to request approval"). The header is
+            # ignored on tenants and resources that do not require approval, so send it on every delete.
+            # The value must be base64 of the UTF-8 text - Intune rejects plain text outright.
+            $Justification = [string]$Reason
+            if ([string]::IsNullOrWhiteSpace($Justification)) { $Justification = 'Denied and deleted from CIPP drift review' }
+            if ($Justification.Length -gt 1024) { $Justification = $Justification.Substring(0, 1024) }
+            $Justification = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Justification))
             $Results = foreach ($Deviation in $Deviations) {
                 try {
                     $user = $request.headers.'x-ms-client-principal'
                     $username = ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($user)) | ConvertFrom-Json).userDetails
-                    $Result = Set-CIPPDriftDeviation -TenantFilter $TenantFilter -StandardName $Deviation.standardName -Status $Deviation.status -Reason $Reason -user $username
-                    [PSCustomObject]@{
-                        success = $true
-                        result  = $Result
-                    }
-                    Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Updated drift deviation status for $($Deviation.standardName) to $($Deviation.status) with reason: $Reason" -Sev 'Info'
+                    # The status is written at the end of this block, after the action it implies succeeds.
                     if ($Deviation.status -eq 'DeniedRemediate') {
                         $Setting = $Deviation.standardName -replace 'standards\.', ''
                         $StandardTemplate = Get-CIPPTenantAlignment -TenantFilter $TenantFilter | Where-Object -Property standardType -EQ 'drift'
@@ -102,8 +105,10 @@ function Invoke-ExecUpdateDriftDeviation {
                             if (-not $MatchedTemplate) {
                                 Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Could not find IntuneTemplate $TemplateId in drift standard settings for remediation" -Sev 'Warning'
                             } else {
-                                $MatchedTemplate | Add-Member -MemberType NoteProperty -Name 'remediate' -Value $true -Force
-                                $MatchedTemplate | Add-Member -MemberType NoteProperty -Name 'report' -Value $true -Force
+                                $MatchedTemplate | Add-Member -NotePropertyMembers ([ordered]@{
+                                        remediate = $true
+                                        report    = $true
+                                    }) -Force
                                 $Settings = $MatchedTemplate
                             }
                         } elseif ($Setting -like '*ConditionalAccessTemplate*') {
@@ -119,8 +124,10 @@ function Invoke-ExecUpdateDriftDeviation {
                             if (-not $MatchedTemplate) {
                                 Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Could not find ConditionalAccessTemplate $TemplateId in drift standard settings for remediation" -Sev 'Warning'
                             } else {
-                                $MatchedTemplate | Add-Member -MemberType NoteProperty -Name 'remediate' -Value $true -Force
-                                $MatchedTemplate | Add-Member -MemberType NoteProperty -Name 'report' -Value $true -Force
+                                $MatchedTemplate | Add-Member -NotePropertyMembers ([ordered]@{
+                                        remediate = $true
+                                        report    = $true
+                                    }) -Force
                                 $Settings = $MatchedTemplate
                             }
                         } elseif ($Setting -like '*QuarantineTemplate*') {
@@ -142,8 +149,10 @@ function Invoke-ExecUpdateDriftDeviation {
                             if (-not $MatchedTemplate) {
                                 Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Could not find QuarantineTemplate '$PolicyName' in drift standard settings for remediation" -Sev 'Warning'
                             } else {
-                                $MatchedTemplate | Add-Member -MemberType NoteProperty -Name 'remediate' -Value $true -Force
-                                $MatchedTemplate | Add-Member -MemberType NoteProperty -Name 'report' -Value $true -Force
+                                $MatchedTemplate | Add-Member -NotePropertyMembers ([ordered]@{
+                                        remediate = $true
+                                        report    = $true
+                                    }) -Force
                                 $Settings = $MatchedTemplate
                             }
                         } elseif ($Setting -like '*ReusableSettingsTemplate*') {
@@ -153,8 +162,10 @@ function Invoke-ExecUpdateDriftDeviation {
                             if (-not $MatchedTemplate) {
                                 Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Could not find ReusableSettingsTemplate $TemplateId in drift standard settings for remediation" -Sev 'Warning'
                             } else {
-                                $MatchedTemplate | Add-Member -MemberType NoteProperty -Name 'remediate' -Value $true -Force
-                                $MatchedTemplate | Add-Member -MemberType NoteProperty -Name 'report' -Value $true -Force
+                                $MatchedTemplate | Add-Member -NotePropertyMembers ([ordered]@{
+                                        remediate = $true
+                                        report    = $true
+                                    }) -Force
                                 $Settings = $MatchedTemplate
                             }
                         } else {
@@ -167,8 +178,10 @@ function Invoke-ExecUpdateDriftDeviation {
                                 }
                                 $StandardTemplate.PSObject.Properties.Remove('standards')
                             }
-                            $StandardTemplate | Add-Member -MemberType NoteProperty -Name 'remediate' -Value $true -Force
-                            $StandardTemplate | Add-Member -MemberType NoteProperty -Name 'report' -Value $true -Force
+                            $StandardTemplate | Add-Member -NotePropertyMembers ([ordered]@{
+                                    remediate = $true
+                                    report    = $true
+                                }) -Force
                             $Settings = $StandardTemplate
                         }
                         if ($Settings) {
@@ -227,6 +240,7 @@ function Invoke-ExecUpdateDriftDeviation {
                                 success      = $false
                                 error        = "The deviation status was updated, but no remediation task was scheduled: '$Setting' could not be resolved from the drift template settings. Verify the template still exists in the template library and is included in the drift template, or re-save the drift template."
                             }
+                            Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Could not find standard $Setting in drift standard settings for remediation" -Sev 'Warning'
                         }
                     }
                     if ($Deviation.status -eq 'deniedDelete') {
@@ -240,9 +254,47 @@ function Invoke-ExecUpdateDriftDeviation {
                         $ID = $Policy.ID
                         if ($Policy -and $URLName) {
                             Write-Host "Going to delete Policy with ID $($Policy.ID) Deviation Name is $($Deviation.standardName)"
-                            $null = New-GraphPostRequest -uri "https://graph.microsoft.com/beta/$($URLName)/$($ID)" -type DELETE -tenant $TenantFilter
-                            "Deleted Policy $($ID)"
-                            Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Deleted Policy with ID $($ID)" -Sev 'Info'
+                            try {
+                                $null = New-GraphPostRequest -uri "https://graph.microsoft.com/beta/$($URLName)/$($ID)" -type DELETE -tenantid $TenantFilter -AddedHeaders @{ 'x-msft-approval-justification' = $Justification }
+                                "Deleted Policy $($ID)"
+                                Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Deleted Policy with ID $($ID)" -Sev 'Info'
+                            } catch {
+                                # Multi-admin approval never deletes inline. The first call registers an approval
+                                # request, fails, and returns its id in the x-msft-approval-code header (echoed
+                                # into the error body); repeat calls while that request is open fail with "An
+                                # active Approval Request already exists" and no header. Both are pending changes
+                                # rather than failures - report them so the deletion can be tracked in Intune.
+                                $RawError = $_.Exception.Data['RawErrorBody'] ?? $_.Exception.Message
+                                $ApprovalCode = if ($RawError -match 'x-msft-approval-code["'':\\\s]*([0-9a-fA-F-]{36})') { $Matches[1] } else { $null }
+                                $ApprovalExists = $RawError -match 'active Approval Request already exists'
+                                if ($ApprovalCode) {
+                                    # Approval alone does not perform the delete - the request has to be
+                                    # resubmitted with the approval code once a second admin approves it.
+                                    # Hand that off so the deletion completes without anyone returning here.
+                                    try {
+                                        $null = Invoke-CIPPIntuneApprovalRetry -TenantFilter $TenantFilter -ApprovalCode $ApprovalCode -ResourcePath "$($URLName)/$($ID)" -Type 'DELETE'
+                                        $ApprovalText = "Approval request $ApprovalCode has been raised - CIPP will complete the deletion once another administrator approves it in Intune"
+                                    } catch {
+                                        $ApprovalText = "Approval request $ApprovalCode has been raised, but the follow-up could not be scheduled ($($_.Exception.Message)). Approve the request in Intune and repeat this action"
+                                    }
+                                    [PSCustomObject]@{
+                                        resultText = "Policy $($ID) was not deleted: this tenant requires multi-admin approval in Intune. $ApprovalText."
+                                        state      = 'warning'
+                                        copyField  = $ApprovalCode
+                                    }
+                                    Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Deletion of policy $($ID) requires multi-admin approval. $ApprovalText." -Sev 'Warning'
+                                } elseif ($ApprovalExists) {
+                                    # A request raised earlier is still open, and Intune returns no code for it,
+                                    # so there is nothing to poll against - the admin has to drive this one.
+                                    [PSCustomObject]@{
+                                        resultText = "Policy $($ID) was not deleted: an Intune multi-admin approval request for it is already open. Approve or reject it in Intune, then repeat this action."
+                                        state      = 'warning'
+                                    }
+                                    Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Deletion of policy $($ID) is already awaiting multi-admin approval in Intune." -Sev 'Warning'
+                                } else {
+                                    throw
+                                }
+                            }
                         } else {
                             "could not find policy with ID $($ID)"
                             Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Could not find Policy with ID $($ID) to delete for remediation" -sev 'Warning'
@@ -250,6 +302,14 @@ function Invoke-ExecUpdateDriftDeviation {
 
 
                     }
+
+                    # Task queued / policy gone; a throw above leaves the row untouched.
+                    $Result = Set-CIPPDriftDeviation -TenantFilter $TenantFilter -StandardName $Deviation.standardName -Status $Deviation.status -Reason $Reason -user $username
+                    [PSCustomObject]@{
+                        success = $true
+                        result  = $Result
+                    }
+                    Write-LogMessage -tenant $TenantFilter -Headers $Request.Headers -API $APINAME -message "Updated drift deviation status for $($Deviation.standardName) to $($Deviation.status) with reason: $Reason" -Sev 'Info'
                 } catch {
                     [PSCustomObject]@{
                         standardName = $Deviation.standardName
