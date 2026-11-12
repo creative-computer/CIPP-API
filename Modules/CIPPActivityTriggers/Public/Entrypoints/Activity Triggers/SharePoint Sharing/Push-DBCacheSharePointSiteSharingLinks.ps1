@@ -7,38 +7,43 @@ function Push-DBCacheSharePointSiteSharingLinks {
     .DESCRIPTION
         One activity, two roles, discriminated by the payload:
 
-        Site task ($Item.DriveId absent) - lists the site's document libraries, records how many
-        drive tasks the site owns (drives-{site} row), and dispatches one drive task per drive
-        through a child orchestration. Sites whose drives cannot be listed (locked/blocked sites,
-        throttling) complete immediately as failed. The Preservation Hold Library is skipped by
-        URL segment: it is a hidden system library that cannot carry sharing links and is often
-        by far the largest drive on the site.
+        Site task ($Item.DriveId absent) - lists the site's document libraries and records them in
+        the drives-{site} row; the site run's post-execution queues every site's drives as one
+        capped run per tenant (Push-SharingLinksDispatchDrives). Sites whose drives cannot be
+        listed (locked/blocked sites, throttling) complete immediately as failed. The Preservation
+        Hold Library is skipped by URL segment: it is a hidden system library that cannot carry
+        sharing links and is often by far the largest drive on the site. One SharePoint REST call per
+        site finds each library's item count (for scan progress) and whether it holds its own
+        permissions: an inheriting library's root
+        only repeats the site's permissions, so its root is not read. Links cannot be set on a
+        library root, so the root read exists only for direct grants on the library itself.
 
         Drive task ($Item.DriveId present) - scans one drive for shared items and writes
-        sharing-link rows to the reporting DB page by page. Three scan modes:
+        sharing-link rows to the CippSharingLinks table page by page. Two scan modes:
 
-          Principal   - full scan of a non-personal site's drive. Enumerates the backing list
-                        with the hidden PrincipalCount field (999 rows per request); only items
-                        whose principal count differs from the drive's inherited baseline have
-                        extra role assignments (sharing links, direct grants), and only those get
-                        a batched driveItem + permissions read. On group-connected team sites the
-                        delta 'shared' facet is true for EVERY item (group access), so the classic
-                        path costs one permission read per item; this path replaces that with
-                        items/999 list pages + a permission read per actually-shared item.
-                        The drive's deltaLink is captured afterwards via delta?token=latest so the
-                        next scan runs incrementally.
-          Full        - classic delta walk reading permissions for every shared-facet item. Used
-                        for personal sites (OneDrive only flags genuinely shared items) and for
-                        ForceFullSync, where it serves as the ground-truth deep scan.
+          Full        - delta walk reading permissions for every shared-facet item. This is the
+                        ground truth, deliberately: a PrincipalCount pre-filter was tried and
+                        removed because paged list enumeration serves stale principal counts on
+                        large busy lists, silently under-reporting shares. The delta is read with
+                        Prefer: hierarchicalsharing, so only permission-hierarchy roots and
+                        explicitly shared items carry the facet; without it every file on a
+                        group-connected team site does, costing a permission read per file.
           Incremental - delta from the stored token; only changed items are processed. Changed
                         items' existing rows are tombstoned and re-added from a fresh permission
-                        read.
+                        read. A drive runs full only without a token, when the token is rejected,
+                        or when it holds fewer rows than its last scan recorded.
 
-        Timebox - a drive task that exceeds CIPP_SHARINGLINKS_TIMEBOX_SECONDS (default 900)
-        checkpoints and re-dispatches itself instead of running into the platform kill limit
-        (Worker:BgTimeoutSeconds, default 1200): the runtime marks a timed-out task Failed
-        without retry, so the task must yield before that. The checkpoint written after every
-        persisted page means a re-dispatched task loses at most one page.
+        An item can appear in a delta more than once; only its last occurrence counts, so rows
+        written for an earlier occurrence in the same scan are tombstoned like stale ones.
+
+        Redrive - a drive task that is killed at the platform limit or throttled out mid-scan
+        leaves its drive without a completion marker. The drive run's post-execution queues every
+        such drive again for as long as it keeps saving pages, and each resumes from the checkpoint
+        written after every persisted page, so it loses at most one page. A drive that saved no
+        page in a round stops for this scan (Stalled): it keeps its rows, stores its position on
+        its delta row, and the next scan resumes from there - or rescans in full if the position is
+        rejected. Rows carry the id of the scan that started their pass (PassId), so a full pass
+        spanning several scans still sweeps only what it did not rewrite.
 
         Completion is tracked with insert-only marker rows (first writer wins), never counters:
         a scan-row counter was abandoned because concurrent decrements lost ETag races, and the
@@ -47,7 +52,7 @@ function Push-DBCacheSharePointSiteSharingLinks {
 
         CippSharingLinksState rows (PartitionKey = tenant):
           scan                      scan identity: ScanId, TotalSites, FullSweep, StartedUtc
-          drives-{site}             site's dispatched drive-task count for this scan
+          drives-{site}             site's drives for this scan (count, ids, site details)
           ddone-{site}~{drive}      drive task completion marker (idempotent insert)
           done-{site}               site completion marker; Failed=true means the SITE failed
                                     (drives could not be listed) - drive-level failures instead
@@ -55,7 +60,9 @@ function Push-DBCacheSharePointSiteSharingLinks {
                                     their cached rows from finalisation pruning
           final                     finalisation claim marker (one finaliser per scan)
           chk-{site}~{drive}        drive task resume position, ScanId-gated
-          delta-{drive}             per-drive delta token + last-scan bookkeeping
+          delta-{drive}             per-drive delta token, row count, stored resume position +
+                                    last-scan bookkeeping
+          summary                   tenant link count and when the last scan finalised
 
         The activity that completes the tenant's last pending site claims the 'final' marker and
         runs Push-StoreSharePointSharingLinks inline.
@@ -66,22 +73,13 @@ function Push-DBCacheSharePointSiteSharingLinks {
     [CmdletBinding()]
     param($Item)
 
-    $TenantFilter = Resolve-CIPPSharingLinksTenantFilter -TenantFilter $Item.TenantFilter
+    $TenantFilter = [string]$Item.TenantFilter
     $SiteId = $Item.SiteId
     $SiteName = $Item.SiteName
     $SiteUrl = $Item.SiteUrl
     $IsPersonalSite = [bool]$Item.IsPersonalSite
     $ScanId = [string]$Item.ScanId
     $ForceFull = [bool]$Item.ForceFull
-    $CacheType = 'SharePointSharingLinks'
-
-    $FullScanDays = 14
-    if ($env:CIPP_SHARINGLINKS_FULLSCAN_DAYS -match '^\d+$') { $FullScanDays = [Math]::Max(1, [int]$env:CIPP_SHARINGLINKS_FULLSCAN_DAYS) }
-    # Re-dispatch budget: stay under the platform kill limit with room to finish the current
-    # page - Craft kills background tasks at Worker:BgTimeoutSeconds (1200s), the Functions
-    # consumption plan at 10 minutes.
-    $TimeboxSeconds = if ($env:CIPPNG -eq 'true') { 1100 } else { 540 }
-    if ($env:CIPP_SHARINGLINKS_TIMEBOX_SECONDS -match '^\d+$') { $TimeboxSeconds = [Math]::Max(1, [int]$env:CIPP_SHARINGLINKS_TIMEBOX_SECONDS) }
 
     $InternalDomains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($Domain in @($Item.InternalDomains)) { if ($Domain) { [void]$InternalDomains.Add([string]$Domain) } }
@@ -147,36 +145,42 @@ function Push-DBCacheSharePointSiteSharingLinks {
 
             $SharedWith = @($Recipients | ForEach-Object { Get-CIPPIdentityLabel -Identity $_ } | Where-Object { $_ } | Sort-Object -Unique)
 
-            $RowsOut.Add([PSCustomObject]@{
-                    id                   = "$($Drive.id)_$($DriveItem.id)_$($Permission.id)"
-                    siteId               = $Site.SiteId
-                    siteName             = $Site.SiteName
-                    siteUrl              = $Site.SiteUrl
+            $Id = "$($Drive.id)_$($DriveItem.id)_$($Permission.id)"
+            $RowsOut.Add(@{
+                    PartitionKey         = $TenantFilter
+                    RowKey               = ([string]$Id -replace '[/\\#?]', '_' -replace '[\u0000-\u001F\u007F-\u009F]', '')
+                    ScanId               = $PassId
+                    id                   = $Id
+                    siteId               = [string]$Site.SiteId
+                    siteName             = [string]$Site.SiteName
+                    siteUrl              = [string]$Site.SiteUrl
                     workload             = if ($Site.IsPersonalSite) { 'OneDrive' } else { 'SharePoint' }
-                    driveId              = $Drive.id
-                    driveName            = $Drive.name
-                    itemId               = $DriveItem.id
-                    fileName             = $DriveItem.name
-                    itemUrl              = $DriveItem.webUrl
+                    driveId              = [string]$Drive.id
+                    driveName            = [string]$Drive.name
+                    itemId               = [string]$DriveItem.id
+                    fileName             = [string]$DriveItem.name
+                    itemUrl              = [string]$DriveItem.webUrl
                     itemType             = if ($DriveItem.folder) { 'Folder' } else { 'File' }
-                    size                 = $DriveItem.size
-                    lastModifiedDateTime = $DriveItem.lastModifiedDateTime
-                    permissionId         = $Permission.id
-                    linkType             = $LinkType
-                    linkScope            = $LinkScope
-                    classification       = $Classification
-                    roles                = @($Permission.roles)
-                    sharedWith           = $SharedWith
-                    linkUrl              = $LinkUrl
-                    hasPassword          = $Permission.hasPassword ?? $false
-                    expirationDateTime   = $Permission.expirationDateTime
+                    size                 = [int64]($DriveItem.size ?? 0)
+                    lastModifiedDateTime = if ($DriveItem.lastModifiedDateTime -is [datetime]) { $DriveItem.lastModifiedDateTime.ToUniversalTime().ToString('o') } else { [string]$DriveItem.lastModifiedDateTime }
+                    permissionId         = [string]$Permission.id
+                    linkType             = [string]$LinkType
+                    linkScope            = [string]$LinkScope
+                    classification       = [string]$Classification
+                    roles                = [string](ConvertTo-Json -InputObject @($Permission.roles) -Compress)
+                    sharedWith           = [string](ConvertTo-Json -InputObject @($SharedWith) -Compress)
+                    linkUrl              = [string]$LinkUrl
+                    hasPassword          = [bool]($Permission.hasPassword ?? $false)
+                    expirationDateTime   = if ($Permission.expirationDateTime -is [datetime]) { $Permission.expirationDateTime.ToUniversalTime().ToString('o') } else { [string]$Permission.expirationDateTime }
                 })
         }
     }
 
     # Fetch permissions for a buffer of shared delta items and append their rows to $RowsOut.
+    # Failed batch responses are counted into $DropCounter: a full scan that lost reads must not
+    # prune the unread items' still-valid rows afterwards.
     function Add-CIPPSharingRows {
-        param($Buffer, $Drive, $Site, $InternalDomains, $TenantFilter, $RowsOut)
+        param($Buffer, $Drive, $Site, $InternalDomains, $TenantFilter, $RowsOut, [ref]$DropCounter)
         if (@($Buffer).Count -eq 0) { return }
         $ItemByRequestId = @{}
         $RequestId = 0
@@ -191,7 +195,10 @@ function Push-DBCacheSharePointSiteSharingLinks {
         }
         $PermissionResponses = New-GraphBulkRequest -tenantid $TenantFilter -Requests @($PermissionRequests) -asapp $true
         foreach ($Response in $PermissionResponses) {
-            if ($Response.status -and $Response.status -ne 200) { continue }
+            if ($Response.status -and $Response.status -ne 200) {
+                if ($DropCounter) { $DropCounter.Value++ }
+                continue
+            }
             $DriveItem = $ItemByRequestId["$($Response.id)"]
             ConvertTo-CIPPSharingRow -Permissions @($Response.body.value) -DriveItem $DriveItem -Drive $Drive -Site $Site -InternalDomains $InternalDomains -RowsOut $RowsOut
         }
@@ -201,8 +208,9 @@ function Push-DBCacheSharePointSiteSharingLinks {
     # These read the surrounding activity's variables directly; they exist to keep the call sites
     # readable, not to be reused.
     $StateTable = Get-CippTable -tablename 'CippSharingLinksState'
+    $LinksTable = Get-CippTable -tablename 'CippSharingLinks'
     $SafeTenant = ConvertTo-CIPPODataFilterValue -Value $TenantFilter -Type String
-    $SiteKeySegment = ConvertTo-CIPPSharingLinksKeySegment -Value $SiteId
+    $SiteKeySegment = ([string]$SiteId -replace '[/\\#?]', '_' -replace '[\u0000-\u001F\u007F-\u009F]', '')
 
     function Get-ScanRow {
         Get-CIPPAzDataTableEntity @StateTable -Filter "PartitionKey eq '$SafeTenant' and RowKey eq 'scan'"
@@ -306,32 +314,40 @@ function Push-DBCacheSharePointSiteSharingLinks {
                 return @()
             }
 
-            # Record the drive-task total BEFORE dispatching: a drive task finishing first must
-            # be able to see how many siblings it has.
-            Add-CIPPAzDataTableEntity @StateTable -Entity @{
-                PartitionKey = $TenantFilter
-                RowKey       = "drives-$SiteKeySegment"
-                ScanId       = $ScanId
-                DriveCount   = [int]$Drives.Count
-            } -Force
-
-            $Batch = foreach ($Drive in $Drives) {
-                [PSCustomObject]@{
-                    FunctionName    = 'DBCacheSharePointSiteSharingLinks'
-                    TenantFilter    = $TenantFilter
-                    SiteId          = $SiteId
-                    SiteName        = $SiteName
-                    SiteUrl         = $SiteUrl
-                    IsPersonalSite  = $IsPersonalSite
-                    InternalDomains = @($InternalDomains)
-                    ScanId          = $ScanId
-                    DriveId         = [string]$Drive.id
-                    DriveName       = [string]$Drive.name
-                    ForceFull       = $ForceFull
-                    QueueId         = $Item.QueueId
-                    QueueName       = "Sharing Links - $($Drive.name) - $SiteUrl"
+            # Library root path -> its list. A library this cannot place keeps its root read and has no item count.
+            $Libraries = @{}
+            if ($Item.SharePointScope) {
+                try {
+                    $Lists = @(New-GraphGetRequest -uri "$($SiteUrl.TrimEnd('/'))/_api/web/lists?`$select=ItemCount,HasUniqueRoleAssignments,RootFolder/ServerRelativeUrl&`$expand=RootFolder" -tenantid $TenantFilter -scope $Item.SharePointScope -extraHeaders @{ Accept = 'application/json;odata=nometadata' } -UseCertificate -AsApp $true)
+                    foreach ($List in $Lists) {
+                        if ($List.RootFolder.ServerRelativeUrl) { $Libraries[[string]$List.RootFolder.ServerRelativeUrl] = $List }
+                    }
+                } catch {
+                    Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: could not check library permissions on '$SiteUrl', reading every library root: $($_.Exception.Message)" -sev Debug
                 }
             }
+
+            # The dispatch post-execution builds every round's drive tasks from this row.
+            Add-CIPPAzDataTableEntity @StateTable -Entity @{
+                PartitionKey   = $TenantFilter
+                RowKey         = "drives-$SiteKeySegment"
+                ScanId         = $ScanId
+                DriveCount     = [int]$Drives.Count
+                SiteId         = [string]$SiteId
+                SiteName       = [string]$SiteName
+                SiteUrl        = [string]$SiteUrl
+                IsPersonalSite = $IsPersonalSite
+                DrivesJson     = [string](ConvertTo-Json -InputObject @($Drives | ForEach-Object {
+                            $List = if ($_.webUrl) { $Libraries[[uri]::UnescapeDataString(([uri][string]$_.webUrl).AbsolutePath)] }
+                            @{
+                                id        = [string]$_.id
+                                name      = [string]$_.name
+                                readRoot  = $null -eq $List -or $List.HasUniqueRoleAssignments -ne $false
+                                itemCount = [int64]($List.ItemCount ?? -1)
+                            }
+                        }) -Compress)
+            } -Force
+
             if ($Item.QueueId) {
                 try {
                     Update-CippQueueEntry -RowKey $Item.QueueId -TotalTasks $Drives.Count -IncrementTotalTasks
@@ -339,11 +355,6 @@ function Push-DBCacheSharePointSiteSharingLinks {
                     Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: could not update queue $($Item.QueueId) with drive tasks: $($_.Exception.Message)" -sev Debug
                 }
             }
-            $null = Start-CIPPOrchestrator -InputObject ([PSCustomObject]@{
-                    Batch            = @($Batch)
-                    OrchestratorName = "SharingLinksDrives_$($TenantFilter)_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-                    SkipLog          = $true
-                })
             return @()
         } catch {
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: failed dispatching drives for '$SiteUrl': $($_.Exception.Message)" -sev Error -LogData (Get-CippException -Exception $_)
@@ -354,9 +365,9 @@ function Push-DBCacheSharePointSiteSharingLinks {
 
     # ================================ DRIVE TASK: scan one drive ================================
     $Drive = [PSCustomObject]@{ id = [string]$Item.DriveId; name = [string]$Item.DriveName }
-    $DriveKeySegment = ConvertTo-CIPPSharingLinksKeySegment -Value "$($Drive.id)"
+    $ReadRoot = $Item.ReadRoot -ne $false
+    $DriveKeySegment = ([string]$Drive.id -replace '[/\\#?]', '_' -replace '[\u0000-\u001F\u007F-\u009F]', '')
     $CheckpointRowKey = "chk-$SiteKeySegment~$DriveKeySegment"
-    $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
     function Get-DriveCheckpoint {
         $Row = Get-CIPPAzDataTableEntity @StateTable -Filter "PartitionKey eq '$SafeTenant' and RowKey eq '$CheckpointRowKey'"
@@ -379,11 +390,11 @@ function Push-DBCacheSharePointSiteSharingLinks {
         if ($Row) { Remove-CIPPAzDataTableEntity @StateTable -Entity $Row -Force }
     }
 
-    # Records the drive's scan outcome: delta token and which scan last saw it. Called on success
-    # AND failure - a current LastScanId is what protects a failed drive's cached rows from
-    # finalisation pruning. An empty DeltaLink forces the next scan to run full.
+    # Records the drive's scan outcome: delta token, which scan last saw it and how many rows it
+    # holds. Called on success AND failure - a current LastScanId is what protects a failed drive's
+    # cached rows from finalisation pruning. An empty DeltaLink forces the next scan to run full.
     function Set-DriveState {
-        param([AllowEmptyString()][string]$DeltaLink = '', [switch]$FullScan)
+        param([AllowEmptyString()][string]$DeltaLink = '', [switch]$FullScan, $Resume)
         $NowUtc = [string]([DateTimeOffset]::UtcNow.ToString('o'))
         $Existing = Get-CIPPSharingLinksDriveState -TenantFilter $TenantFilter -DriveId $Drive.id
         $LastFullScanUtc = if ($FullScan) { $NowUtc } else { [string]($Existing.LastFullScanUtc ?? '') }
@@ -396,6 +407,13 @@ function Push-DBCacheSharePointSiteSharingLinks {
             LastScanId      = $ScanId
             LastScanUtc     = $NowUtc
             LastFullScanUtc = $LastFullScanUtc
+            RootItemId      = [string]($RootItemId ?? $Existing.RootItemId ?? '')
+            ResumeUri       = [string]$Resume.CurrentUri
+            ResumeMode      = [string]$Resume.CurrentMode
+            ResumePassId    = [string]$Resume.PassId
+            ResumeItemsSeen = [int64]($Resume.ItemsSeen ?? 0)
+            ResumeDropped   = [int]($Resume.DroppedReads ?? 0)
+            RowCount        = @(Get-CIPPSharingLinksRowKeysByPrefix -TenantFilter $TenantFilter -Prefix "${DriveKeySegment}_").Count
         } -Force
     }
 
@@ -408,156 +426,87 @@ function Push-DBCacheSharePointSiteSharingLinks {
         if ($DoneDrives -ge [int]$DrivesRow.DriveCount) { Complete-Site }
     }
 
-    # Checkpoints the position, re-dispatches this drive task and returns $true when the timebox
-    # is spent. The platform kills tasks at Worker:BgTimeoutSeconds WITHOUT retrying them, so a
-    # long drive must yield on its own; the fresh task resumes from the checkpoint.
-    function Invoke-TimeboxRequeue {
-        param($State)
-        if ($Stopwatch.Elapsed.TotalSeconds -lt $TimeboxSeconds) { return $false }
-        Save-DriveCheckpoint -State $State
-        Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: timebox reached on drive '$($Drive.name)' ($SiteUrl); requeueing to resume" -sev Debug
-        $null = Start-CIPPOrchestrator -InputObject ([PSCustomObject]@{
-                Batch            = @($Item)
-                OrchestratorName = "SharingLinksResume_$($TenantFilter)_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-                SkipLog          = $true
-            })
-        return $true
+    if ($Item.Stalled) {
+        # No page saved since the last round: keep the rows and the position, and let the next scan resume.
+        $Checkpoint = Get-DriveCheckpoint
+        $Existing = Get-CIPPSharingLinksDriveState -TenantFilter $TenantFilter -DriveId $Drive.id
+        Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: drive '$($Drive.name)' ($SiteUrl) stopped making progress; keeping its rows and resuming next scan" -sev Warning
+        Set-DriveState -DeltaLink ([string]$Existing.DeltaLink) -Resume $(if ($Checkpoint.CurrentUri) { $Checkpoint } else { $Existing | Where-Object { $_.ResumeUri } | ForEach-Object { @{ CurrentUri = $_.ResumeUri; CurrentMode = $_.ResumeMode; PassId = $_.ResumePassId; ItemsSeen = $_.ResumeItemsSeen; DroppedReads = $_.ResumeDropped } } })
+        Remove-DriveCheckpoint
+        Complete-Drive
+        return @()
     }
 
-    $DeltaSelect = 'id,name,webUrl,folder,shared,deleted,size,lastModifiedDateTime'
+    $DeltaSelect = 'id,name,webUrl,folder,shared,deleted,size,lastModifiedDateTime,root'
     $FullDeltaUri = "https://graph.microsoft.com/beta/drives/$($Drive.id)/root/delta?`$select=$DeltaSelect&`$top=999"
 
     try {
-        # Where does this drive start: checkpoint > stored delta token > full scan. Full scans of
-        # non-personal sites use the PrincipalCount path unless this is a forced ground-truth
-        # sync; OneDrive keeps the classic path because its shared facet is already selective.
+        # Where does this drive start: checkpoint > stored delta token > full scan. Full scans
+        # always walk the delta ground truth. A PrincipalCount pre-filter was tried here and
+        # removed: paged list enumeration serves STALE principal counts on large, busy lists
+        # (linked items kept reading the inherited count days after their links were created),
+        # silently under-reporting shares.
         $Checkpoint = Get-DriveCheckpoint
-        $Mode = if ($IsPersonalSite -or $ForceFull) { 'Full' } else { 'Principal' }
+        $Mode = 'Full'
         $Uri = $null
-        $Baseline = $null
-        if ($Checkpoint -and $Checkpoint.CurrentUri) {
+        $PassId = $ScanId
+        $ItemsSeen = [int64]0
+        $DroppedReads = 0
+        $Resumed = $false
+        $DriveState = Get-CIPPSharingLinksDriveState -TenantFilter $TenantFilter -DriveId $Drive.id
+        if ($Checkpoint -and $Checkpoint.CurrentUri -and [string]$Checkpoint.CurrentMode -in @('Full', 'Incremental')) {
             $Mode = [string]$Checkpoint.CurrentMode
             $Uri = [string]$Checkpoint.CurrentUri
-            $Baseline = $Checkpoint.Baseline
-        } elseif (-not $ForceFull) {
-            $DriveState = Get-CIPPSharingLinksDriveState -TenantFilter $TenantFilter -DriveId $Drive.id
-            $LastFull = $(try { [DateTimeOffset]::Parse([string]$DriveState.LastFullScanUtc) } catch { [DateTimeOffset]::MinValue })
-            if ($DriveState.DeltaLink -and $LastFull -gt [DateTimeOffset]::UtcNow.AddDays(-$FullScanDays)) {
-                $Mode = 'Incremental'
-                $Uri = [string]$DriveState.DeltaLink
-            }
+            $PassId = [string]($Checkpoint.PassId ?? $ScanId)
+            $ItemsSeen = [int64]($Checkpoint.ItemsSeen ?? 0)
+            $DroppedReads = [int]($Checkpoint.DroppedReads ?? 0)
+            $Resumed = $true
+        } elseif (-not $ForceFull -and $DriveState.ResumeUri -and [string]$DriveState.ResumeMode -in @('Full', 'Incremental')) {
+            # A previous scan stopped this drive part way; carry on from where it got to.
+            $Mode = [string]$DriveState.ResumeMode
+            $Uri = [string]$DriveState.ResumeUri
+            $PassId = [string]($DriveState.ResumePassId ?? $ScanId)
+            $ItemsSeen = [int64]($DriveState.ResumeItemsSeen ?? 0)
+            $DroppedReads = [int]($DriveState.ResumeDropped ?? 0)
+            $Resumed = $true
+        } elseif (-not $ForceFull -and $DriveState.DeltaLink -and $null -ne $DriveState.RowCount) {
+            $Mode = 'Incremental'
+            $Uri = [string]$DriveState.DeltaLink
         }
 
-        # ---------------- Principal mode: list enumeration filtered on PrincipalCount ----------
-        if ($Mode -eq 'Principal') {
-            try {
-                if (-not $Uri) {
-                    $List = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/drives/$($Drive.id)/list?`$select=id" -tenantid $TenantFilter -asapp $true
-                    if (-not $List.id) { throw 'drive has no backing list' }
-                    # Baseline = the number of principals an item inherits when nothing was ever
-                    # shared on it. The drive root's permission objects are exactly that set.
-                    $RootPermissions = @(New-GraphGetRequest -uri "https://graph.microsoft.com/beta/drives/$($Drive.id)/root/permissions?`$select=id" -tenantid $TenantFilter -asapp $true)
-                    $Baseline = [int]$RootPermissions.Count
-                    $Uri = "https://graph.microsoft.com/beta/sites/$SiteId/lists/$($List.id)/items?`$top=999&`$select=id&`$expand=fields(`$select=PrincipalCount)"
-                }
-
-                $DroppedReads = 0
-                while ($Uri) {
-                    $Page = New-GraphGetRequest -uri $Uri -tenantid $TenantFilter -asapp $true -noPagination $true -SkipValueExtraction
-
-                    # An item whose principal count deviates from the inherited baseline carries
-                    # extra (or unusual) role assignments; the permission read is the ground truth
-                    # that filters inherited-only false positives back out.
-                    $FlaggedIds = [System.Collections.Generic.List[string]]::new()
-                    foreach ($ListItem in @($Page.value)) {
-                        if ([int]$ListItem.fields.PrincipalCount -ne $Baseline -and $ListItem.id) { $FlaggedIds.Add([string]$ListItem.id) }
-                    }
-
-                    $PageRows = [System.Collections.Generic.List[object]]::new()
-                    if ($FlaggedIds.Count -gt 0) {
-                        $RequestId = 0
-                        $ItemRequests = foreach ($FlaggedId in $FlaggedIds) {
-                            @{
-                                id     = "$RequestId"
-                                method = 'GET'
-                                url    = "sites/$SiteId/lists/$($List.id)/items/$FlaggedId/driveItem?`$select=id,name,webUrl,folder,size,lastModifiedDateTime&`$expand=permissions"
-                            }
-                            $RequestId++
-                        }
-                        $ItemResponses = New-GraphBulkRequest -tenantid $TenantFilter -Requests @($ItemRequests) -asapp $true
-                        foreach ($Response in $ItemResponses) {
-                            if ($Response.status -and $Response.status -ne 200) { $DroppedReads++; continue }
-                            ConvertTo-CIPPSharingRow -Permissions @($Response.body.permissions) -DriveItem $Response.body -Drive $Drive -Site $SiteContext -InternalDomains $InternalDomains -RowsOut $PageRows
-                        }
-                    }
-                    if ($PageRows.Count -gt 0) {
-                        Add-CIPPDbItem -TenantFilter $TenantFilter -Type $CacheType -Data @($PageRows) -Append -RunId $ScanId
-                    }
-
-                    $Uri = [string]$Page.'@odata.nextLink'
-                    if ($Uri) {
-                        $State = @{ CurrentUri = $Uri; CurrentMode = 'Principal'; Baseline = $Baseline }
-                        Save-DriveCheckpoint -State $State
-                        if (Invoke-TimeboxRequeue -State $State) { return @() }
-                    }
-                }
-
-                if ($DroppedReads -gt 0) {
-                    # Throttled/failed batch responses mean some shared items were not rewritten
-                    # this scan. Pruning now would delete their still-valid rows, so keep
-                    # everything and force the next scan to run this drive full again.
-                    Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: $DroppedReads permission reads dropped on drive '$($Drive.name)' ($SiteUrl); keeping existing rows and deferring the sweep to the next full scan" -sev Warning
-                    Set-DriveState -DeltaLink ''
-                } else {
-                    # Everything currently shared was rewritten with this scan's id; the rest is
-                    # stale by definition.
-                    $null = Remove-CIPPSharingLinksRowsByPrefix -TenantFilter $TenantFilter -Prefix "$CacheType-${DriveKeySegment}_" -ExceptRunId $ScanId
-
-                    # Capture the delta position without walking the drive, so the next scan of
-                    # this drive runs incrementally off the classic path.
-                    $DeltaLink = ''
-                    try {
-                        $TokenPage = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/drives/$($Drive.id)/root/delta?token=latest&`$select=id" -tenantid $TenantFilter -asapp $true -noPagination $true -SkipValueExtraction
-                        $DeltaLink = [string]$TokenPage.'@odata.deltaLink'
-                    } catch {
-                        Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: could not capture delta token for drive '$($Drive.name)' on '$SiteUrl': $($_.Exception.Message)" -sev Debug
-                    }
-                    Set-DriveState -DeltaLink $DeltaLink -FullScan
-                }
-            } catch {
-                if ($_.Exception.Message -match 'Access to this site has been blocked') {
-                    # Site locked mid-scan: links are inactive, so leave the drive state stale
-                    # for finalisation to prune rather than protecting this drive's rows.
-                    Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: drive '$($Drive.name)' on '$SiteUrl' is locked; leaving its rows for pruning" -sev Info
-                } else {
-                    Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: failed scanning drive '$($Drive.name)' on '$SiteUrl': $($_.Exception.Message)" -sev Warning
-                    # A current LastScanId with an empty token both protects this drive's cached
-                    # rows from pruning and forces the next scan to run full.
-                    Set-DriveState -DeltaLink ''
-                }
-            }
-            Remove-DriveCheckpoint
-            Complete-Drive
-            return @()
+        # Every row the drive holds, by item: a changed item's rows are tombstoned before it is
+        # re-read, and rows written for an earlier occurrence of an item in this scan are
+        # tombstoned when it appears again, so only its last occurrence survives.
+        $RowsByItem = @{}
+        $StoredRows = 0
+        foreach ($Row in (Get-CIPPSharingLinksRowKeysByPrefix -TenantFilter $TenantFilter -Prefix "${DriveKeySegment}_")) {
+            if (-not $Row.RowKey) { continue }
+            $StoredRows++
+            $ItemKey = [string]$Row.itemId
+            if (-not $RowsByItem.ContainsKey($ItemKey)) { $RowsByItem[$ItemKey] = [System.Collections.Generic.List[object]]::new() }
+            $RowsByItem[$ItemKey].Add($Row)
         }
-
-        # ---------------- Full / Incremental: classic delta walk -------------------------------
+        if ($Mode -eq 'Incremental' -and -not $Resumed -and $StoredRows -lt [int]$DriveState.RowCount) {
+            Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: drive '$($Drive.name)' ($SiteUrl) holds $StoredRows of its $($DriveState.RowCount) rows; scanning it in full" -sev Info
+            $Mode = 'Full'
+            $Uri = $null
+        }
         if (-not $Uri) { $Uri = $FullDeltaUri }
 
-        # Incremental scans tombstone every changed item's existing rows before re-adding the
-        # ones it still carries. One keys-only read up front replaces a per-item query: the
-        # itemId is recoverable from the RowKey because it sits between the known drive
-        # prefix and the next '_' (SPO item ids never contain underscores).
-        $ExistingRowsByItem = $null
-        if ($Mode -eq 'Incremental') {
-            $ExistingRowsByItem = @{}
-            $DrivePrefix = "$CacheType-${DriveKeySegment}_"
-            foreach ($Row in (Get-CIPPSharingLinksRowKeysByPrefix -TenantFilter $TenantFilter -Prefix $DrivePrefix)) {
-                if (-not $Row.RowKey) { continue }
-                $Suffix = ([string]$Row.RowKey).Substring($DrivePrefix.Length)
-                $ItemKey = $Suffix.Split('_')[0]
-                if (-not $ExistingRowsByItem.ContainsKey($ItemKey)) { $ExistingRowsByItem[$ItemKey] = [System.Collections.Generic.List[object]]::new() }
-                $ExistingRowsByItem[$ItemKey].Add($Row)
+        # A library's own permissions can change without its root reaching the delta, so an
+        # incremental scan re-reads that root; an inheriting library's old root rows are dropped.
+        $RootItemId = $null
+        $ExtraItems = @()
+        if ($Mode -eq 'Incremental' -and -not $Resumed) {
+            if ($ReadRoot) {
+                try {
+                    $Root = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/drives/$($Drive.id)/root?`$select=$DeltaSelect" -tenantid $TenantFilter -asapp $true
+                    $ExtraItems = @([pscustomobject]@{ id = $Root.id; name = $Root.name; webUrl = $Root.webUrl; folder = $Root.folder; size = $Root.size; lastModifiedDateTime = $Root.lastModifiedDateTime; root = @{}; shared = @{} })
+                } catch {
+                    Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: could not re-read the root of '$($Drive.name)' ($SiteUrl); keeping its rows until the next scan: $($_.Exception.Message)" -sev Debug
+                }
+            } elseif ($DriveState.RootItemId) {
+                $ExtraItems = @([pscustomobject]@{ id = [string]$DriveState.RootItemId; root = @{} })
             }
         }
 
@@ -565,15 +514,17 @@ function Push-DBCacheSharePointSiteSharingLinks {
         $DriveFailed = $false
         while ($Uri) {
             try {
-                $Page = New-GraphGetRequest -uri $Uri -tenantid $TenantFilter -asapp $true -noPagination $true -SkipValueExtraction
+                $Page = New-GraphGetRequest -uri $Uri -tenantid $TenantFilter -asapp $true -noPagination $true -SkipValueExtraction -extraHeaders @{ Prefer = 'hierarchicalsharing, deltashowremovedasdeleted, deltatraversepermissiongaps, deltashowsharingchanges' }
             } catch {
                 $ErrorMessage = $_.Exception.Message
-                if ($Mode -eq 'Incremental' -and $ErrorMessage -match 'resync|SyncStateNotFound|Gone|410') {
-                    # Token invalidated server-side; the drive needs a fresh full enumeration.
-                    Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: delta token for drive '$($Drive.name)' on '$SiteUrl' expired; falling back to full scan" -sev Debug
+                if ($Uri -ne $FullDeltaUri -and $ErrorMessage -match 'resync|SyncStateNotFound|Gone|410') {
+                    # Token or stored position invalidated server-side; the drive needs a fresh full enumeration.
+                    Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: delta position for drive '$($Drive.name)' on '$SiteUrl' expired; falling back to full scan" -sev Debug
                     $Mode = 'Full'
                     $Uri = $FullDeltaUri
-                    $ExistingRowsByItem = $null
+                    $PassId = $ScanId
+                    $ItemsSeen = 0
+                    $DroppedReads = 0
                     continue
                 }
                 if ($ErrorMessage -match 'Access to this site has been blocked') {
@@ -584,38 +535,51 @@ function Push-DBCacheSharePointSiteSharingLinks {
                     Complete-Drive
                     return @()
                 }
+                if ($ErrorMessage -match 'throttl|too many requests|429|503|504|service unavailable|gateway time') {
+                    # Left incomplete: the drive run's post-execution redrives it from the checkpoint.
+                    Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: throttled or unavailable mid-scan on drive '$($Drive.name)' ($SiteUrl); it will resume from its checkpoint" -sev Info
+                    return @()
+                }
                 Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: failed scanning drive '$($Drive.name)' on '$SiteUrl': $ErrorMessage" -sev Warning
                 $DriveFailed = $true
                 break
             }
 
+            $ItemsSeen = $ItemsSeen + @($Page.value).Count
             $Buffer = [System.Collections.Generic.List[object]]::new()
             $TombstoneRows = [System.Collections.Generic.List[object]]::new()
-            foreach ($PageItem in @($Page.value)) {
-                if ($Mode -eq 'Incremental' -and $ExistingRowsByItem) {
-                    # Every changed item invalidates whatever rows it had - deleted items,
-                    # items no longer shared, and items whose link set changed all converge
-                    # on: drop the old rows, re-add from the fresh permission read below.
-                    $ItemKey = ConvertTo-CIPPSharingLinksKeySegment -Value "$($PageItem.id)"
-                    if ($ExistingRowsByItem.ContainsKey($ItemKey)) {
-                        foreach ($Row in $ExistingRowsByItem[$ItemKey]) { $TombstoneRows.Add($Row) }
-                        $ExistingRowsByItem.Remove($ItemKey)
+            foreach ($PageItem in @($ExtraItems) + @($Page.value)) {
+                $ItemKey = [string]$PageItem.id
+                if ($PageItem.root) { $RootItemId = $ItemKey }
+                if ($RowsByItem.ContainsKey($ItemKey)) {
+                    # Incremental: every changed item invalidates the rows it had - deleted items,
+                    # items no longer shared and items whose link set changed all converge on a
+                    # fresh read. Full: only rows from an earlier occurrence in this scan; older
+                    # rows are overwritten or swept once the drive completes.
+                    $Keep = [System.Collections.Generic.List[object]]::new()
+                    foreach ($Row in $RowsByItem[$ItemKey]) {
+                        if ($Mode -eq 'Incremental' -or [string]$Row.ScanId -eq $PassId) { $TombstoneRows.Add($Row) } else { $Keep.Add($Row) }
                     }
+                    $RowsByItem[$ItemKey] = $Keep
                 }
-                if ($PageItem.shared -and -not $PageItem.deleted) { $Buffer.Add($PageItem) }
+                if ($PageItem.shared -and -not $PageItem.deleted -and ($ReadRoot -or -not $PageItem.root)) { $Buffer.Add($PageItem) }
             }
+            $ExtraItems = @()
 
             # Rows for this page: permission lookups happen per page so the checkpoint below
             # never advances past work that has not been persisted.
             $PageRows = [System.Collections.Generic.List[object]]::new()
-            Add-CIPPSharingRows -Buffer $Buffer -Drive $Drive -Site $SiteContext -InternalDomains $InternalDomains -TenantFilter $TenantFilter -RowsOut $PageRows
+            Add-CIPPSharingRows -Buffer $Buffer -Drive $Drive -Site $SiteContext -InternalDomains $InternalDomains -TenantFilter $TenantFilter -RowsOut $PageRows -DropCounter ([ref]$DroppedReads)
 
             if ($TombstoneRows.Count -gt 0) {
-                $Table = Get-CippTable -tablename 'CippReportingDB'
-                $null = Remove-CIPPAzDataTableEntity @Table -Entity $TombstoneRows.ToArray() -Force
+                $null = Remove-CIPPAzDataTableEntity @LinksTable -Entity $TombstoneRows.ToArray() -Force
             }
             if ($PageRows.Count -gt 0) {
-                Add-CIPPDbItem -TenantFilter $TenantFilter -Type $CacheType -Data @($PageRows) -Append -RunId $ScanId
+                $null = Add-CIPPAzDataTableEntity @LinksTable -Entity $PageRows.ToArray() -Force
+                foreach ($Row in $PageRows) {
+                    if (-not $RowsByItem.ContainsKey($Row.itemId)) { $RowsByItem[$Row.itemId] = [System.Collections.Generic.List[object]]::new() }
+                    $RowsByItem[$Row.itemId].Add(@{ PartitionKey = $Row.PartitionKey; RowKey = $Row.RowKey; ETag = '*'; ScanId = $PassId })
+                }
             }
 
             if ($Page.'@odata.deltaLink') {
@@ -627,24 +591,24 @@ function Push-DBCacheSharePointSiteSharingLinks {
 
             # This page's rows are persisted, so the resume position may advance past it.
             if ($Uri) {
-                $State = @{ CurrentUri = $Uri; CurrentMode = $Mode }
-                Save-DriveCheckpoint -State $State
-                if (Invoke-TimeboxRequeue -State $State) { return @() }
+                Save-DriveCheckpoint -State @{ CurrentUri = $Uri; CurrentMode = $Mode; PassId = $PassId; ItemsSeen = $ItemsSeen; DroppedReads = $DroppedReads }
             }
         }
 
-        if ($DriveFailed) {
-            # An empty token in Full mode forces the next scan to start over, while a
-            # preserved token in Incremental mode simply retries the same delta next scan.
-            $KeepToken = if ($Mode -eq 'Incremental') {
-                [string](Get-CIPPSharingLinksDriveState -TenantFilter $TenantFilter -DriveId $Drive.id).DeltaLink
-            } else { '' }
+        if ($DriveFailed -or $DroppedReads -gt 0) {
+            # Throttled/failed batch reads mean some items were not rewritten this scan. A full
+            # scan keeps every row and runs full again next time; an incremental one keeps its old
+            # token so the next scan replays the same changes, re-reading what was dropped.
+            if ($DroppedReads -gt 0) {
+                Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Sharing links: $DroppedReads permission reads dropped on drive '$($Drive.name)' ($SiteUrl); keeping existing rows and retrying next scan" -sev Warning
+            }
+            $KeepToken = if ($Mode -eq 'Incremental') { [string]$DriveState.DeltaLink } else { '' }
             Set-DriveState -DeltaLink $KeepToken
         } else {
             if ($Mode -eq 'Full') {
                 # The scan rewrote every shared item's rows with this scan's id; anything left
                 # under the drive's prefix without it is a link that no longer exists.
-                $null = Remove-CIPPSharingLinksRowsByPrefix -TenantFilter $TenantFilter -Prefix "$CacheType-${DriveKeySegment}_" -ExceptRunId $ScanId
+                $null = Remove-CIPPSharingLinksRowsByPrefix -TenantFilter $TenantFilter -Prefix "${DriveKeySegment}_" -ExceptScanId $PassId
             }
             Set-DriveState -DeltaLink ($DeltaLink ?? '') -FullScan:($Mode -eq 'Full')
         }

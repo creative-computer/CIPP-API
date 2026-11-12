@@ -232,26 +232,51 @@ namespace CIPP.Reporting
         public const char EmojiInfo = 'ℹ';
         private static readonly HashSet<char> EmojiKept = new() { EmojiWarning, EmojiCheck, EmojiInfo };
 
-        // When a fallback emoji font is bundled, the reports' portable ASCII status tokens are promoted to
-        // the matching glyph (rendered downstream); with no font/image assets they stay as tokens, so the
-        // report degrades gracefully. Set once by ReportPdf from whether the font loaded.
-        public static bool RenderEmojiGlyphs;
+        // The monochrome fallback font ships next to the assembly as emoji-fallback.ttf (like the OfficeIMO
+        // DLLs). Loaded once; absence just means emoji degrade to the ASCII tokens rather than throwing.
+        internal static readonly Lazy<byte[]?> EmojiFontBytes = new(() =>
+        {
+            try
+            {
+                var dir = System.IO.Path.GetDirectoryName(typeof(ReportMarkdown).Assembly.Location);
+                if (string.IsNullOrEmpty(dir)) return null;
+                var path = System.IO.Path.Combine(dir, "emoji-fallback.ttf");
+                return System.IO.File.Exists(path) ? System.IO.File.ReadAllBytes(path) : null;
+            }
+            catch { return null; }
+        });
+
+        // Exactly the code points the bundled font can draw above U+00FF, minus the CP1252 specials the
+        // standard fonts render: the single source of truth for what Sanitize keeps (keeping one the font
+        // can't draw would make OfficeIMO's encoding preflight throw) and which ranges ReportPdf declares
+        // for the fallback. Read once from the font's own cmap so the two never drift; empty without a font.
+        private static readonly Lazy<HashSet<int>> EmojiCoverageSet = new(() =>
+        {
+            var set = new HashSet<int>();
+            var font = EmojiFontBytes.Value;
+            if (font is not { Length: > 0 }) return set;
+            try
+            {
+                foreach (var cp in FontCmap.ReadCodepoints(font))
+                    if (cp > 0xFF && !IsWinAnsiSpecial(cp)) set.Add(cp);
+            }
+            catch { set.Clear(); }
+            return set;
+        });
+        public static HashSet<int> EmojiCoverage => EmojiCoverageSet.Value;
+
+        // With the fallback font bundled, the reports' portable ASCII status tokens are promoted to the
+        // matching glyph (rendered downstream); without it they stay as tokens, so the report degrades.
+        public static bool RenderEmojiGlyphs => EmojiFontBytes.Value is { Length: > 0 };
 
         // True when the bundled Twemoji colour PNG set is present, so an emoji grapheme cluster (including
         // multi-code-point ZWJ sequences, flags and skin tones) is kept whole for the renderer to place as
-        // an inline colour image. Set once by ReportPdf from TwemojiAssets.Enabled.
-        public static bool RenderEmojiImages;
+        // an inline colour image; the monochrome font remains the fallback for anything not bundled.
+        public static bool RenderEmojiImages => TwemojiAssets.Enabled;
         private static readonly (string token, string glyph)[] EmojiTokens =
         {
             ("[!]", "⚠"), ("[Pass]", "✅"), ("[Fail]", "❌"), ("[i]", "ℹ"),
         };
-
-        // Every code point the bundled fallback font can actually draw, above U+00FF and excluding the
-        // CP1252 specials the standard fonts already encode. Populated once by ReportPdf straight from the
-        // font's cmap, so Sanitize only ever keeps an emoji the font can render - keeping one it can't
-        // would make OfficeIMO's encoding preflight throw. Empty when no font is bundled (emoji then
-        // degrade to '?'/tokens), so this is also the source of truth for the fallback's declared ranges.
-        public static HashSet<int> EmojiCoverage = new();
 
         // CP1252 / WinAnsi code points above U+00FF that the PDF standard fonts CAN encode - kept as-is.
         private static readonly HashSet<char> WinAnsiSpecials = new(new[]
@@ -270,7 +295,10 @@ namespace CIPP.Reporting
         /// tokens (a monochrome filled circle can't tell red from green), then keep anything the fonts can
         /// draw - at or below U+00FF, the CP1252 punctuation set, or, when a fallback font is bundled, an
         /// emoji that font actually carries (BMP or astral). Any remaining non-encodable character becomes
-        /// '?' so OfficeIMO's encoding preflight never throws.
+        /// '?' so OfficeIMO's encoding preflight never throws. Control characters (a vertical tab or form
+        /// feed left in stored text, a stray NUL, a C1 control) have no glyph and the preflight rejects
+        /// them outright: whitespace-like ones collapse to a single space and the rest are dropped. A line
+        /// feed is kept: the kit's runs use it as their line break.
         /// </summary>
         public static string Sanitize(string? s)
         {
@@ -278,7 +306,7 @@ namespace CIPP.Reporting
             foreach (var g in GlyphMap) s = s.Replace(g.from, g.to);
             if (RenderEmojiGlyphs) foreach (var e in EmojiTokens) s = s.Replace(e.token, e.glyph);
             var needsFilter = false;
-            foreach (var c in s) { if (c > 'ÿ' && !WinAnsiSpecials.Contains(c) && !EmojiKept.Contains(c)) { needsFilter = true; break; } }
+            foreach (var c in s) { if ((c > 'ÿ' && !WinAnsiSpecials.Contains(c) && !EmojiKept.Contains(c)) || (char.IsControl(c) && c != '\n')) { needsFilter = true; break; } }
             if (!needsFilter) return s;
             var sb = new StringBuilder(s.Length);
             // Walk by grapheme cluster so a multi-code-point emoji (ZWJ sequence, flag, skin-tone) is judged
@@ -288,11 +316,16 @@ namespace CIPP.Reporting
             while (elements.MoveNext())
             {
                 var cluster = (string)elements.Current;
-                if (cluster.Length == 1 && cluster[0] <= 'ÿ') { sb.Append(cluster); continue; }
+                if (cluster.Length == 1 && cluster[0] <= 'ÿ' && (cluster[0] == '\n' || !char.IsControl(cluster[0]))) { sb.Append(cluster); continue; }
                 if (RenderEmojiImages && TwemojiAssets.Has(cluster)) { sb.Append(cluster); continue; }
                 for (var i = 0; i < cluster.Length; i++)
                 {
                     var c = cluster[i];
+                    if (char.IsControl(c) && c != '\n')
+                    {
+                        if (char.IsWhiteSpace(c) && sb.Length > 0 && sb[sb.Length - 1] != ' ') sb.Append(' ');
+                        continue;
+                    }
                     if (char.IsHighSurrogate(c) && i + 1 < cluster.Length && char.IsLowSurrogate(cluster[i + 1]))
                     {
                         var cp = char.ConvertToUtf32(c, cluster[i + 1]);
